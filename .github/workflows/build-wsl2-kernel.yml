@@ -13,11 +13,15 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build_kernel:
     name: 构建内核
     runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check-need-build.outputs.should_build }}
+      tag: ${{ steps.get-tag.outputs.tag }}
     steps:
       - name: 工作流信息展示
         run: |
@@ -38,10 +42,11 @@ jobs:
         id: get-tag
         run: |
           set -euo pipefail
-          echo "步骤 1/7: 获取版本标签"
+          echo "步骤 1/8: 获取版本标签"
           if [ -n "${{ inputs.tag }}" ]; then
             TAG="${{ inputs.tag }}"
             echo "使用手动指定的标签: $TAG"
+            PUBLISHED_AT=""
           else
             echo "正在调用 GitHub API 获取最新发布版..."
             echo "API 地址: https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/latest"
@@ -54,18 +59,104 @@ jobs:
             echo "API 响应成功，解析 tag_name..."
             TAG=$(echo "$API_RESPONSE" | jq -r '.tag_name')
             RELEASE_NAME=$(echo "$API_RESPONSE" | jq -r '.name')
+            PUBLISHED_AT=$(echo "$API_RESPONSE" | jq -r '.published_at')
             echo "使用最新发布版"
             echo "   标签: $TAG"
             echo "   发布名称: $RELEASE_NAME"
+            echo "   发布时间: $PUBLISHED_AT"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "published_at=$PUBLISHED_AT" >> "$GITHUB_OUTPUT"
           echo "src-dir=WSL2-Linux-Kernel-$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: 检查是否需要编译
+        id: check-need-build
+        run: |
+          set -euo pipefail
+          echo "步骤 2/8: 检查是否需要编译"
+          TAG="${{ steps.get-tag.outputs.tag }}"
+          PUBLISHED_AT="${{ steps.get-tag.outputs.published_at }}"
+          EVENT_NAME="${{ github.event_name }}"
+          SHOULD_BUILD="true"
+          SKIP_REASON=""
+          
+          echo "检查条件 1: 是否为手动触发"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "手动触发，将执行编译"
+            SHOULD_BUILD="true"
+          else
+            echo "检查条件 2: 是否已存在该标签的 artifact"
+            echo "查询当前仓库的 artifacts..."
+            ARTIFACT_NAME="bzImage-$TAG"
+            ARTIFACT_FOUND="false"
+            ARTIFACT_API="https://api.github.com/repos/${{ github.repository }}/actions/artifacts"
+            ARTIFACT_RESPONSE=$(curl -sSfL \
+              --retry 3 \
+              --retry-delay 5 \
+              --user-agent "GitHub Actions (WSL2 Kernel Build)" \
+              --header "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "$ARTIFACT_API" || echo "{}")
+            echo "查询 artifact 响应"
+            if echo "$ARTIFACT_RESPONSE" | grep -q "\"name\":\"$ARTIFACT_NAME\""; then
+              echo "发现已存在的 artifact: $ARTIFACT_NAME"
+              ARTIFACT_FOUND="true"
+            else
+              echo "未发现已存在的 artifact: $ARTIFACT_NAME"
+            fi
+            
+            if [ "$ARTIFACT_FOUND" = "true" ]; then
+              echo "该标签的 artifact 已存在，跳过编译"
+              SHOULD_BUILD="false"
+              SKIP_REASON="该标签的 artifact 已存在"
+            else
+              echo "未发现已存在的 artifact，继续检查发布时间"
+              
+              if [ -n "$PUBLISHED_AT" ]; then
+                echo "检查条件 3: 发布时间是否在最近 2 天内"
+                PUBLISHED_SECONDS=$(date -d "$PUBLISHED_AT" +%s 2>/dev/null || echo 0)
+                NOW_SECONDS=$(date +%s)
+                TWO_DAYS=$((2 * 24 * 3600))
+                if [ "$PUBLISHED_SECONDS" -eq 0 ]; then
+                  echo "无法解析发布时间，继续执行编译"
+                  SHOULD_BUILD="true"
+                else
+                  TIME_DIFF=$((NOW_SECONDS - PUBLISHED_SECONDS))
+                  echo "发布至今: $TIME_DIFF 秒"
+                  if [ "$TIME_DIFF" -le "$TWO_DAYS" ]; then
+                    echo "发布在 2 天内，将执行编译"
+                    SHOULD_BUILD="true"
+                  else
+                    echo "发布时间超过 2 天，跳过编译"
+                    SHOULD_BUILD="false"
+                    SKIP_REASON="发布时间超过 2 天"
+                  fi
+                fi
+              else
+                echo "无发布时间信息，将执行编译"
+                SHOULD_BUILD="true"
+              fi
+            fi
+          fi
+          
+          echo "===================="
+          echo "编译决策结果"
+          echo "===================="
+          echo "标签: $TAG"
+          echo "需要编译: $SHOULD_BUILD"
+          if [ -n "$SKIP_REASON" ]; then
+            echo "跳过原因: $SKIP_REASON"
+          fi
+          echo "===================="
+          
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=$SKIP_REASON" >> "$GITHUB_OUTPUT"
+
       - name: 下载并解压源码
+        if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
           TAG="${{ steps.get-tag.outputs.tag }}"
-          echo "步骤 2/7: 下载并解压源码"
+          echo "步骤 3/8: 下载并解压源码"
           echo "下载地址: https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$TAG.tar.gz"
           echo "正在下载..."
           curl -sSfL \
@@ -93,9 +184,10 @@ jobs:
           echo "源码准备完成"
 
       - name: 安装编译依赖
+        if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          echo "步骤 3/7: 安装编译依赖"
+          echo "步骤 4/8: 安装编译依赖"
           echo "正在更新软件包列表..."
           sudo apt-get update -qq
           echo "正在安装编译依赖..."
@@ -121,9 +213,10 @@ jobs:
           gcc --version
 
       - name: 编译内核
+        if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          echo "步骤 4/7: 编译内核"
+          echo "步骤 5/8: 编译内核"
           cd "${{ steps.get-tag.outputs.src-dir }}"
           echo "当前目录: $(pwd)"
           echo "检查配置文件 Microsoft/config-wsl:"
@@ -148,9 +241,10 @@ jobs:
           echo "内核编译完成"
 
       - name: 验证 bzImage
+        if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          echo "步骤 5/7: 验证 bzImage"
+          echo "步骤 6/8: 验证 bzImage"
           BZIMAGE_PATH="${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/bzImage"
           if [ ! -f "$BZIMAGE_PATH" ]; then
             echo "错误: 在 $BZIMAGE_PATH 未找到 bzImage"
@@ -166,9 +260,10 @@ jobs:
           ls -la "${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/"
 
       - name: 编译摘要
+        if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          echo "步骤 6/7: 编译摘要"
+          echo "步骤 7/8: 编译摘要"
           echo "======================================="
           echo "构建成功！"
           echo "======================================="
@@ -183,6 +278,7 @@ jobs:
           echo "======================================="
 
       - name: 上传最终 bzImage
+        if: steps.check-need-build.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bzImage-${{ steps.get-tag.outputs.tag }}
