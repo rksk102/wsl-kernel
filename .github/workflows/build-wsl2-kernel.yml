@@ -1,4 +1,4 @@
-name: 构建 WSL2 内核（主流程）
+name: 构建 WSL2 内核
 
 on:
   schedule:
@@ -15,28 +15,88 @@ permissions:
   contents: read
 
 jobs:
-  获取版本标签:
-    uses: ./.github/workflows/get-latest-tag.yml
-    with:
-      tag: ${{ inputs.tag }}
-    secrets:
-      github-token: ${{ secrets.GITHUB_TOKEN }}
+  构建内核:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 获取版本标签
+        id: get-tag
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+            echo "使用手动指定的标签: $TAG"
+          else
+            echo "正在获取最新发布版标签..."
+            TAG=$(curl -sSfL \
+              --retry 3 \
+              --retry-delay 5 \
+              --user-agent "GitHub Actions (WSL2 Kernel Build)" \
+              --header "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/latest" | \
+              jq -r '.tag_name')
+            echo "使用最新发布版标签: $TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "src-dir=WSL2-Linux-Kernel-$TAG" >> "$GITHUB_OUTPUT"
 
-  下载源码:
-    needs: 获取版本标签
-    uses: ./.github/workflows/download-source.yml
-    with:
-      tag: ${{ needs.获取版本标签.outputs.tag }}
+      - name: 下载并解压源码
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.get-tag.outputs.tag }}"
+          echo "正在下载标签 $TAG 的源码..."
+          curl -sSfL \
+            --retry 3 \
+            --retry-delay 5 \
+            --user-agent "GitHub Actions (WSL2 Kernel Build)" \
+            -o kernel.tar.gz \
+            "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$TAG.tar.gz"
+          echo "正在解压源码包..."
+          tar xzf kernel.tar.gz
+          echo "清理临时文件 kernel.tar.gz..."
+          rm -f kernel.tar.gz
 
-  编译内核:
-    needs: [获取版本标签, 下载源码]
-    uses: ./.github/workflows/build-kernel.yml
-    with:
-      tag: ${{ needs.获取版本标签.outputs.tag }}
-      src-dir: ${{ needs.下载源码.outputs.src-dir }}
+      - name: 安装编译依赖
+        run: |
+          set -euo pipefail
+          echo "正在更新软件包列表..."
+          sudo apt-get update -qq
+          echo "正在安装编译依赖..."
+          sudo apt-get install -y \
+            build-essential \
+            flex \
+            bison \
+            dwarves \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            python3 \
+            cpio \
+            qemu-utils
 
-  上传最终产物:
-    needs: [获取版本标签, 编译内核]
-    uses: ./.github/workflows/upload-artifact.yml
-    with:
-      tag: ${{ needs.获取版本标签.outputs.tag }}
+      - name: 编译内核
+        run: |
+          set -euo pipefail
+          cd "${{ steps.get-tag.outputs.src-dir }}"
+          echo "内核编译开始于: $(date -u)"
+          echo "使用 $(nproc) 个并行任务"
+          time make -j$(nproc) KCONFIG_CONFIG=Microsoft/config-wsl
+          echo "内核编译完成于: $(date -u)"
+
+      - name: 验证 bzImage
+        run: |
+          set -euo pipefail
+          BZIMAGE_PATH="${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/bzImage"
+          if [ ! -f "$BZIMAGE_PATH" ]; then
+            echo "错误: 在 $BZIMAGE_PATH 未找到 bzImage"
+            exit 1
+          fi
+          echo "bzImage 验证成功！"
+          echo "文件大小: $(du -h "$BZIMAGE_PATH" | cut -f1)"
+
+      - name: 上传最终 bzImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: bzImage-${{ steps.get-tag.outputs.tag }}
+          path: ${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/bzImage
+          retention-days: 90
+          compression-level: 6
