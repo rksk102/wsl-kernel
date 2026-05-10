@@ -1,10 +1,10 @@
-name: Upload Final Kernel Artifact
+name: 上传最终内核产物
 
 on:
   workflow_call:
     inputs:
       tag:
-        description: 'Tag being released'
+        description: '发布标签'
         required: true
         type: string
 
@@ -12,15 +12,15 @@ permissions:
   contents: read
 
 jobs:
-  upload:
+  上传产物:
     runs-on: ubuntu-latest
     steps:
-      - name: Download built kernel
+      - name: 下载编译好的内核
         uses: actions/download-artifact@v4
         with:
           name: kernel-built-${{ inputs.tag }}
           path: .
-      - name: Upload final bzImage
+      - name: 上传最终 bzImage
         uses: actions/upload-artifact@v4
         with:
           name: bzImage-${{ inputs.tag }}

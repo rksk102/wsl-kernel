@@ -1,46 +1,46 @@
-name: Download WSL2 Kernel Source
+name: 下载 WSL2 内核源码
 
 on:
   workflow_call:
     inputs:
       tag:
-        description: 'Tag to download'
+        description: '要下载的标签'
         required: true
         type: string
     outputs:
       src-dir:
-        description: 'Source directory name'
-        value: ${{ jobs.download.outputs.src-dir }}
+        description: '源码目录名称'
+        value: ${{ jobs.下载源码.outputs.src-dir }}
 
 permissions:
   contents: read
 
 jobs:
-  download:
+  下载源码:
     runs-on: ubuntu-latest
     outputs:
       src-dir: ${{ steps.set-env.outputs.src-dir }}
     steps:
-      - name: Download and extract source
+      - name: 下载并解压源码
         id: set-env
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag }}"
-          echo "Downloading source for tag: $TAG"
+          echo "正在下载标签 $TAG 的源码..."
           curl -sSfL \
             --retry 3 \
             --retry-delay 5 \
             --user-agent "GitHub Actions (WSL2 Kernel Build)" \
             -o kernel.tar.gz \
             "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/${TAG}.tar.gz"
-          echo "Extracting source archive..."
+          echo "正在解压源码包..."
           tar xzf kernel.tar.gz
           SRC_DIR="WSL2-Linux-Kernel-${TAG}"
-          echo "Source directory: $SRC_DIR"
+          echo "源码目录: $SRC_DIR"
           echo "src-dir=$SRC_DIR" >> "$GITHUB_OUTPUT"
-          echo "Cleaning up kernel.tar.gz..."
+          echo "清理临时文件 kernel.tar.gz..."
           rm -f kernel.tar.gz
-      - name: Upload source as temporary artifact
+      - name: 上传源码为临时产物
         uses: actions/upload-artifact@v4
         with:
           name: source-${{ inputs.tag }}

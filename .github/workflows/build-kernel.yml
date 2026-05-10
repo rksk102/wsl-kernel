@@ -1,14 +1,14 @@
-name: Build WSL2 Kernel
+name: 编译 WSL2 内核
 
 on:
   workflow_call:
     inputs:
       tag:
-        description: 'Tag being built'
+        description: '正在编译的标签'
         required: true
         type: string
       src-dir:
-        description: 'Source directory name'
+        description: '源码目录名称'
         required: true
         type: string
 
@@ -16,20 +16,20 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  编译内核:
     runs-on: ubuntu-latest
     steps:
-      - name: Download source artifact
+      - name: 下载源码产物
         uses: actions/download-artifact@v4
         with:
           name: source-${{ inputs.tag }}
           path: .
-      - name: Install build dependencies
+      - name: 安装编译依赖
         run: |
           set -euo pipefail
-          echo "Updating package lists..."
+          echo "正在更新软件包列表..."
           sudo apt-get update -qq
-          echo "Installing build dependencies..."
+          echo "正在安装编译依赖..."
           sudo apt-get install -y \
             build-essential \
             flex \
@@ -41,25 +41,25 @@ jobs:
             python3 \
             cpio \
             qemu-utils
-      - name: Build kernel
+      - name: 编译内核
         run: |
           set -euo pipefail
           cd "${{ inputs.src-dir }}"
-          echo "Starting kernel build at: $(date -u)"
-          echo "Using $(nproc) parallel jobs"
+          echo "内核编译开始于: $(date -u)"
+          echo "使用 $(nproc) 个并行任务"
           time make -j$(nproc) KCONFIG_CONFIG=Microsoft/config-wsl
-          echo "Kernel build completed at: $(date -u)"
-      - name: Verify bzImage
+          echo "内核编译完成于: $(date -u)"
+      - name: 验证 bzImage
         run: |
           set -euo pipefail
           BZIMAGE_PATH="${{ inputs.src-dir }}/arch/x86/boot/bzImage"
           if [ ! -f "$BZIMAGE_PATH" ]; then
-            echo "ERROR: bzImage not found at $BZIMAGE_PATH"
+            echo "错误: 在 $BZIMAGE_PATH 未找到 bzImage"
             exit 1
           fi
-          echo "bzImage found successfully!"
-          echo "File size: $(du -h "$BZIMAGE_PATH" | cut -f1)"
-      - name: Upload built kernel as artifact
+          echo "bzImage 验证成功！"
+          echo "文件大小: $(du -h "$BZIMAGE_PATH" | cut -f1)"
+      - name: 上传编译好的内核为临时产物
         uses: actions/upload-artifact@v4
         with:
           name: kernel-built-${{ inputs.tag }}
