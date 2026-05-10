@@ -1,0 +1,42 @@
+name: Build WSL2 Kernel (Main)
+
+on:
+  schedule:
+    - cron: '0 0 */2 * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Specific tag to build (leave empty for latest release)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  get-tag:
+    uses: ./.github/workflows/get-latest-tag.yml
+    with:
+      tag: ${{ inputs.tag }}
+    secrets:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  download-source:
+    needs: get-tag
+    uses: ./.github/workflows/download-source.yml
+    with:
+      tag: ${{ needs.get-tag.outputs.tag }}
+
+  build-kernel:
+    needs: [get-tag, download-source]
+    uses: ./.github/workflows/build-kernel.yml
+    with:
+      tag: ${{ needs.get-tag.outputs.tag }}
+      src-dir: ${{ needs.download-source.outputs.src-dir }}
+
+  upload-final:
+    needs: [get-tag, build-kernel]
+    uses: ./.github/workflows/upload-artifact.yml
+    with:
+      tag: ${{ needs.get-tag.outputs.tag }}

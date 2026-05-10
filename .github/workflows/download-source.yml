@@ -1,0 +1,48 @@
+name: Download WSL2 Kernel Source
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to download'
+        required: true
+        type: string
+    outputs:
+      src-dir:
+        description: 'Source directory name'
+        value: ${{ jobs.download.outputs.src-dir }}
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    outputs:
+      src-dir: ${{ steps.set-env.outputs.src-dir }}
+    steps:
+      - name: Download and extract source
+        id: set-env
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          echo "Downloading source for tag: $TAG"
+          curl -sSfL \
+            --retry 3 \
+            --retry-delay 5 \
+            --user-agent "GitHub Actions (WSL2 Kernel Build)" \
+            -o kernel.tar.gz \
+            "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/${TAG}.tar.gz"
+          echo "Extracting source archive..."
+          tar xzf kernel.tar.gz
+          SRC_DIR="WSL2-Linux-Kernel-${TAG}"
+          echo "Source directory: $SRC_DIR"
+          echo "src-dir=$SRC_DIR" >> "$GITHUB_OUTPUT"
+          echo "Cleaning up kernel.tar.gz..."
+          rm -f kernel.tar.gz
+      - name: Upload source as temporary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-${{ inputs.tag }}
+          path: WSL2-Linux-Kernel-${{ inputs.tag }}
+          retention-days: 1

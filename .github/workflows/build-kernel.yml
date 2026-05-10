@@ -1,0 +1,67 @@
+name: Build WSL2 Kernel
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag being built'
+        required: true
+        type: string
+      src-dir:
+        description: 'Source directory name'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: source-${{ inputs.tag }}
+          path: .
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          echo "Updating package lists..."
+          sudo apt-get update -qq
+          echo "Installing build dependencies..."
+          sudo apt-get install -y \
+            build-essential \
+            flex \
+            bison \
+            dwarves \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            python3 \
+            cpio \
+            qemu-utils
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          cd "${{ inputs.src-dir }}"
+          echo "Starting kernel build at: $(date -u)"
+          echo "Using $(nproc) parallel jobs"
+          time make -j$(nproc) KCONFIG_CONFIG=Microsoft/config-wsl
+          echo "Kernel build completed at: $(date -u)"
+      - name: Verify bzImage
+        run: |
+          set -euo pipefail
+          BZIMAGE_PATH="${{ inputs.src-dir }}/arch/x86/boot/bzImage"
+          if [ ! -f "$BZIMAGE_PATH" ]; then
+            echo "ERROR: bzImage not found at $BZIMAGE_PATH"
+            exit 1
+          fi
+          echo "bzImage found successfully!"
+          echo "File size: $(du -h "$BZIMAGE_PATH" | cut -f1)"
+      - name: Upload built kernel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-built-${{ inputs.tag }}
+          path: ${{ inputs.src-dir }}/arch/x86/boot/bzImage
+          retention-days: 1

@@ -1,0 +1,29 @@
+name: Upload Final Kernel Artifact
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag being released'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-built-${{ inputs.tag }}
+          path: .
+      - name: Upload final bzImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: bzImage-${{ inputs.tag }}
+          path: bzImage
+          retention-days: 90
+          compression-level: 6

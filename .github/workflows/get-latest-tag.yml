@@ -1,0 +1,46 @@
+name: Get WSL2 Kernel Release Tag
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Specific tag to use (leave empty for latest)'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      github-token:
+        required: false
+    outputs:
+      tag:
+        description: 'Selected tag name'
+        value: ${{ jobs.get-tag.outputs.tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  get-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.output-tag.outputs.tag }}
+    steps:
+      - name: Get tag
+        id: output-tag
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+            echo "Using manually specified tag: $TAG"
+          else
+            echo "Fetching latest release tag..."
+            TAG=$(curl -sSfL \
+              --retry 3 \
+              --retry-delay 5 \
+              --user-agent "GitHub Actions (WSL2 Kernel Build)" \
+              --header "Authorization: Bearer ${{ secrets.github-token }}" \
+              "https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/latest" | \
+              jq -r '.tag_name')
+            echo "Using latest release tag: $TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
