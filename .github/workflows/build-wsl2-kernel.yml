@@ -19,23 +19,44 @@ jobs:
     name: 构建内核
     runs-on: ubuntu-latest
     steps:
+      - name: 工作流信息展示
+        run: |
+          echo "=== 工作流开始 ==="
+          echo "触发方式: ${{ github.event_name }}"
+          echo "运行器: ${{ runner.os }} ${{ runner.arch }}"
+          echo "当前时间: $(date)"
+          echo "GitHub 仓库: ${{ github.repository }}"
+          echo "提交 SHA: ${{ github.sha }}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "用户指定标签: ${{ inputs.tag }}"
+          else
+            echo "将获取最新发布版"
+          fi
+          echo "===================="
+
       - name: 获取版本标签
         id: get-tag
         run: |
           set -euo pipefail
+          echo "步骤 1/7: 获取版本标签"
           if [ -n "${{ inputs.tag }}" ]; then
             TAG="${{ inputs.tag }}"
             echo "使用手动指定的标签: $TAG"
           else
-            echo "正在获取最新发布版标签..."
-            TAG=$(curl -sSfL \
+            echo "正在调用 GitHub API 获取最新发布版..."
+            echo "API 地址: https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/latest"
+            API_RESPONSE=$(curl -sSfL \
               --retry 3 \
               --retry-delay 5 \
               --user-agent "GitHub Actions (WSL2 Kernel Build)" \
               --header "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/latest" | \
-              jq -r '.tag_name')
-            echo "使用最新发布版标签: $TAG"
+              "https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/latest")
+            echo "API 响应成功，解析 tag_name..."
+            TAG=$(echo "$API_RESPONSE" | jq -r '.tag_name')
+            RELEASE_NAME=$(echo "$API_RESPONSE" | jq -r '.name')
+            echo "使用最新发布版"
+            echo "   标签: $TAG"
+            echo "   发布名称: $RELEASE_NAME"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "src-dir=WSL2-Linux-Kernel-$TAG" >> "$GITHUB_OUTPUT"
@@ -44,55 +65,122 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.get-tag.outputs.tag }}"
-          echo "正在下载标签 $TAG 的源码..."
+          echo "步骤 2/7: 下载并解压源码"
+          echo "下载地址: https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$TAG.tar.gz"
+          echo "正在下载..."
           curl -sSfL \
             --retry 3 \
             --retry-delay 5 \
             --user-agent "GitHub Actions (WSL2 Kernel Build)" \
+            --progress-bar \
             -o kernel.tar.gz \
             "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$TAG.tar.gz"
+          echo "下载完成"
+          FILE_SIZE=$(du -h kernel.tar.gz | cut -f1)
+          echo "文件大小: $FILE_SIZE"
           echo "正在解压源码包..."
           tar xzf kernel.tar.gz
+          echo "解压完成"
+          SRC_DIR="${{ steps.get-tag.outputs.src-dir }}"
+          if [ -d "$SRC_DIR" ]; then
+            echo "目录大小: $(du -sh "$SRC_DIR" | cut -f1)"
+            echo "文件数: $(find "$SRC_DIR" -type f | wc -l)"
+          else
+            echo "警告: 目录 $SRC_DIR 不存在！"
+          fi
           echo "清理临时文件 kernel.tar.gz..."
           rm -f kernel.tar.gz
+          echo "源码准备完成"
 
       - name: 安装编译依赖
         run: |
           set -euo pipefail
+          echo "步骤 3/7: 安装编译依赖"
           echo "正在更新软件包列表..."
           sudo apt-get update -qq
           echo "正在安装编译依赖..."
-          sudo apt-get install -y \
-            build-essential \
-            flex \
-            bison \
-            dwarves \
-            libssl-dev \
-            libelf-dev \
-            bc \
-            python3 \
-            cpio \
-            qemu-utils
+          DEPENDENCIES=(
+            "build-essential"
+            "flex"
+            "bison"
+            "dwarves"
+            "libssl-dev"
+            "libelf-dev"
+            "bc"
+            "python3"
+            "cpio"
+            "qemu-utils"
+          )
+          echo "将安装 ${#DEPENDENCIES[@]} 个软件包"
+          for pkg in "${DEPENDENCIES[@]}"; do
+            echo "  - $pkg"
+          done
+          sudo apt-get install -y "${DEPENDENCIES[@]}"
+          echo "依赖安装完成"
+          echo "检查 gcc 版本:"
+          gcc --version
 
       - name: 编译内核
         run: |
           set -euo pipefail
+          echo "步骤 4/7: 编译内核"
           cd "${{ steps.get-tag.outputs.src-dir }}"
-          echo "内核编译开始于: $(date -u)"
-          echo "使用 $(nproc) 个并行任务"
+          echo "当前目录: $(pwd)"
+          echo "检查配置文件 Microsoft/config-wsl:"
+          if [ -f "Microsoft/config-wsl" ]; then
+            echo "配置文件存在"
+            echo "配置文件大小: $(du -h Microsoft/config-wsl | cut -f1)"
+          else
+            echo "错误: 配置文件不存在！"
+            exit 1
+          fi
+          echo "开始编译内核..."
+          echo "编译开始时间: $(date -u)"
+          echo "可用核心数: $(nproc)"
+          echo "内存信息:"
+          free -h
+          echo "-------------------"
+          echo "开始 make..."
+          echo "-------------------"
           time make -j$(nproc) KCONFIG_CONFIG=Microsoft/config-wsl
-          echo "内核编译完成于: $(date -u)"
+          echo "-------------------"
+          echo "编译完成时间: $(date -u)"
+          echo "内核编译完成"
 
       - name: 验证 bzImage
         run: |
           set -euo pipefail
+          echo "步骤 5/7: 验证 bzImage"
           BZIMAGE_PATH="${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/bzImage"
           if [ ! -f "$BZIMAGE_PATH" ]; then
             echo "错误: 在 $BZIMAGE_PATH 未找到 bzImage"
+            echo "检查目录内容:"
+            ls -la "${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/" 2>/dev/null || echo "目录不存在"
             exit 1
           fi
           echo "bzImage 验证成功！"
+          echo "文件路径: $BZIMAGE_PATH"
           echo "文件大小: $(du -h "$BZIMAGE_PATH" | cut -f1)"
+          echo "文件权限: $(ls -l "$BZIMAGE_PATH" | awk '{print $1}')"
+          echo "检查其他可能的输出:"
+          ls -la "${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/"
+
+      - name: 编译摘要
+        run: |
+          set -euo pipefail
+          echo "步骤 6/7: 编译摘要"
+          echo "======================================="
+          echo "构建成功！"
+          echo "======================================="
+          TAG="${{ steps.get-tag.outputs.tag }}"
+          echo "标签: $TAG"
+          BZIMAGE_PATH="${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/bzImage"
+          if [ -f "$BZIMAGE_PATH" ]; then
+            echo "文件大小: $(du -h "$BZIMAGE_PATH" | cut -f1)"
+            echo "MD5: $(md5sum "$BZIMAGE_PATH" | cut -d' ' -f1)"
+            echo "SHA256: $(sha256sum "$BZIMAGE_PATH" | cut -d' ' -f1)"
+          fi
+          echo "======================================="
 
       - name: 上传最终 bzImage
         uses: actions/upload-artifact@v4
