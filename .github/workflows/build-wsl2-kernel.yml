@@ -15,7 +15,8 @@ permissions:
   contents: read
 
 jobs:
-  构建内核:
+  build_kernel:
+    name: 构建内核
     runs-on: ubuntu-latest
     steps:
       - name: 获取版本标签
