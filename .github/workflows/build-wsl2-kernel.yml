@@ -16,12 +16,9 @@ permissions:
   actions: read
 
 jobs:
-  build_kernel:
+  build_and_release:
     name: 构建内核
     runs-on: ubuntu-latest
-    outputs:
-      should_build: ${{ steps.check-need-build.outputs.should_build }}
-      tag: ${{ steps.get-tag.outputs.tag }}
     steps:
       - name: 工作流信息展示
         run: |
@@ -49,14 +46,12 @@ jobs:
             PUBLISHED_AT=""
           else
             echo "正在调用 GitHub API 获取最新发布版..."
-            echo "API 地址: https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/latest"
             API_RESPONSE=$(curl -sSfL \
               --retry 3 \
               --retry-delay 5 \
               --user-agent "GitHub Actions (WSL2 Kernel Build)" \
               --header "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               "https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/latest")
-            echo "API 响应成功，解析 tag_name..."
             TAG=$(echo "$API_RESPONSE" | jq -r '.tag_name')
             RELEASE_NAME=$(echo "$API_RESPONSE" | jq -r '.name')
             PUBLISHED_AT=$(echo "$API_RESPONSE" | jq -r '.published_at')
@@ -80,15 +75,11 @@ jobs:
           SHOULD_BUILD="true"
           SKIP_REASON=""
           
-          echo "检查条件 1: 是否为手动触发"
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "手动触发，将执行编译"
             SHOULD_BUILD="true"
           else
-            echo "检查条件 2: 是否已存在该标签的 release"
-            echo "查询当前仓库的 releases..."
-            RELEASE_NAME="$TAG"
-            RELEASE_FOUND="false"
+            echo "检查是否已存在该标签的 release"
             RELEASE_API="https://api.github.com/repos/${{ github.repository }}/releases"
             RELEASE_RESPONSE=$(curl -sSfL \
               --retry 3 \
@@ -98,20 +89,11 @@ jobs:
               "$RELEASE_API" || echo "[]")
             if echo "$RELEASE_RESPONSE" | grep -q "\"tag_name\":\"$TAG\""; then
               echo "发现已存在的 release: $TAG"
-              RELEASE_FOUND="true"
-            else
-              echo "未发现已存在的 release: $TAG"
-            fi
-            
-            if [ "$RELEASE_FOUND" = "true" ]; then
-              echo "该标签的 release 已存在，跳过编译"
               SHOULD_BUILD="false"
               SKIP_REASON="该标签的 release 已存在"
             else
-              echo "未发现已存在的 release，继续检查发布时间"
-              
               if [ -n "$PUBLISHED_AT" ]; then
-                echo "检查条件 3: 发布时间是否在最近 2 天内"
+                echo "检查发布时间是否在最近 2 天内"
                 PUBLISHED_SECONDS=$(date -d "$PUBLISHED_AT" +%s 2>/dev/null || echo 0)
                 NOW_SECONDS=$(date +%s)
                 TWO_DAYS=$((2 * 24 * 3600))
@@ -201,6 +183,7 @@ jobs:
             "python3"
             "cpio"
             "qemu-utils"
+            "gcc-aarch64-linux-gnu"
           )
           echo "将安装 ${#DEPENDENCIES[@]} 个软件包"
           for pkg in "${DEPENDENCIES[@]}"; do
@@ -211,77 +194,138 @@ jobs:
           echo "检查 gcc 版本:"
           gcc --version
 
-      - name: 编译内核
+      - name: 编译内核 (x64)
         if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          echo "步骤 5/9: 编译内核"
-          cd "${{ steps.get-tag.outputs.src-dir }}"
+          echo "步骤 5/9: 编译 x64 内核"
+          SRC_DIR="${{ steps.get-tag.outputs.src-dir }}"
+          cd "$SRC_DIR"
           echo "当前目录: $(pwd)"
-          echo "检查配置文件 Microsoft/config-wsl:"
-          if [ -f "Microsoft/config-wsl" ]; then
+          CONFIG_FILE="Microsoft/config-wsl"
+          echo "使用配置文件: $CONFIG_FILE"
+          if [ -f "$CONFIG_FILE" ]; then
             echo "配置文件存在"
-            echo "配置文件大小: $(du -h Microsoft/config-wsl | cut -f1)"
+            echo "配置文件大小: $(du -h "$CONFIG_FILE" | cut -f1)"
           else
             echo "错误: 配置文件不存在！"
             exit 1
           fi
-          echo "开始编译内核..."
+          echo "开始编译 x64 内核..."
           echo "编译开始时间: $(date -u)"
           echo "可用核心数: $(nproc)"
           echo "内存信息:"
           free -h
           echo "-------------------"
-          echo "开始 make..."
+          echo "开始 make x64..."
           echo "-------------------"
-          time make -j$(nproc) KCONFIG_CONFIG=Microsoft/config-wsl
+          time make -j$(nproc) KCONFIG_CONFIG="$CONFIG_FILE"
           echo "-------------------"
-          echo "编译完成时间: $(date -u)"
-          echo "内核编译完成"
+          echo "x64 编译完成时间: $(date -u)"
 
-      - name: 验证 bzImage
+      - name: 编译内核 (ARM64)
         if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          echo "步骤 6/9: 验证 bzImage"
-          BZIMAGE_PATH="${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/bzImage"
+          echo "步骤 6/9: 编译 ARM64 内核"
+          SRC_DIR="${{ steps.get-tag.outputs.src-dir }}"
+          cd "$SRC_DIR"
+          echo "当前目录: $(pwd)"
+          CONFIG_FILE="Microsoft/config-wsl"
+          echo "使用配置文件: $CONFIG_FILE"
+          echo "清理 x64 编译产物..."
+          make mrproper
+          echo "开始编译 ARM64 内核..."
+          echo "编译开始时间: $(date -u)"
+          echo "可用核心数: $(nproc)"
+          echo "内存信息:"
+          free -h
+          echo "-------------------"
+          echo "开始 make ARM64..."
+          echo "-------------------"
+          time make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCONFIG_CONFIG="$CONFIG_FILE"
+          echo "-------------------"
+          echo "ARM64 编译完成时间: $(date -u)"
+
+      - name: 验证内核镜像
+        if: steps.check-need-build.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          echo "步骤 7/9: 验证内核镜像"
+          TAG="${{ steps.get-tag.outputs.tag }}"
+          SRC_DIR="${{ steps.get-tag.outputs.src-dir }}"
+
+          BZIMAGE_PATH="$SRC_DIR/arch/x86/boot/bzImage"
+          ARM64_IMAGE_PATH="$SRC_DIR/arch/arm64/boot/Image"
+          ARM64_IMAGE_GZ_PATH="$SRC_DIR/arch/arm64/boot/Image.gz"
+
           if [ ! -f "$BZIMAGE_PATH" ]; then
             echo "错误: 在 $BZIMAGE_PATH 未找到 bzImage"
-            echo "检查目录内容:"
-            ls -la "${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/" 2>/dev/null || echo "目录不存在"
+            ls -la "$SRC_DIR/arch/x86/boot/" 2>/dev/null || echo "目录不存在"
             exit 1
           fi
-          echo "bzImage 验证成功！"
+          echo "x64 bzImage 验证成功！"
           echo "文件路径: $BZIMAGE_PATH"
           echo "文件大小: $(du -h "$BZIMAGE_PATH" | cut -f1)"
-          echo "文件权限: $(ls -l "$BZIMAGE_PATH" | awk '{print $1}')"
-          echo "检查其他可能的输出:"
-          ls -la "${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/"
+
+          if [ -f "$ARM64_IMAGE_GZ_PATH" ]; then
+            ARM64_IMAGE="$ARM64_IMAGE_GZ_PATH"
+            ARM64_SUFFIX="Image.gz"
+          elif [ -f "$ARM64_IMAGE_PATH" ]; then
+            ARM64_IMAGE="$ARM64_IMAGE_PATH"
+            ARM64_SUFFIX="Image"
+          else
+            echo "错误: 在 $SRC_DIR/arch/arm64/boot/ 未找到 ARM64 内核镜像"
+            ls -la "$SRC_DIR/arch/arm64/boot/" 2>/dev/null || echo "目录不存在"
+            exit 1
+          fi
+          echo "ARM64 内核镜像验证成功！"
+          echo "文件类型: $ARM64_SUFFIX"
+          echo "文件路径: $ARM64_IMAGE"
+          echo "文件大小: $(du -h "$ARM64_IMAGE" | cut -f1)"
+
+          X64_OUTPUT="bzImage-$TAG-x64"
+          ARM64_OUTPUT="bzImage-$TAG-arm64"
+          cp "$BZIMAGE_PATH" "$X64_OUTPUT"
+          cp "$ARM64_IMAGE" "$ARM64_OUTPUT"
+          echo "x64_output=$X64_OUTPUT" >> "$GITHUB_ENV"
+          echo "arm64_output=$ARM64_OUTPUT" >> "$GITHUB_ENV"
+          echo "文件已重命名为: $X64_OUTPUT, $ARM64_OUTPUT"
 
       - name: 编译摘要
         if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          echo "步骤 7/9: 编译摘要"
+          echo "步骤 8/9: 编译摘要"
           echo "======================================="
           echo "构建成功！"
           echo "======================================="
           TAG="${{ steps.get-tag.outputs.tag }}"
           echo "标签: $TAG"
-          BZIMAGE_PATH="${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/bzImage"
-          if [ -f "$BZIMAGE_PATH" ]; then
-            echo "文件大小: $(du -h "$BZIMAGE_PATH" | cut -f1)"
-            echo "MD5: $(md5sum "$BZIMAGE_PATH" | cut -d' ' -f1)"
-            echo "SHA256: $(sha256sum "$BZIMAGE_PATH" | cut -d' ' -f1)"
+          if [ -f "$x64_output" ]; then
+            echo "--- x64 ---"
+            echo "文件名: $x64_output"
+            echo "文件大小: $(du -h "$x64_output" | cut -f1)"
+            echo "MD5: $(md5sum "$x64_output" | cut -d' ' -f1)"
+            echo "SHA256: $(sha256sum "$x64_output" | cut -d' ' -f1)"
+          fi
+          if [ -f "$arm64_output" ]; then
+            echo "--- ARM64 ---"
+            echo "文件名: $arm64_output"
+            echo "文件大小: $(du -h "$arm64_output" | cut -f1)"
+            echo "MD5: $(md5sum "$arm64_output" | cut -d' ' -f1)"
+            echo "SHA256: $(sha256sum "$arm64_output" | cut -d' ' -f1)"
           fi
           echo "======================================="
 
-      - name: 上传临时 bzImage (保留 1 天)
+      - name: 上传临时内核镜像 (保留 1 天)
         if: steps.check-need-build.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: bzImage-${{ steps.get-tag.outputs.tag }}
-          path: ${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/bzImage
+          name: kernel-images-${{ steps.get-tag.outputs.tag }}
+          path: |
+            ${{ env.x64_output }}
+            ${{ env.arm64_output }}
           retention-days: 1
           compression-level: 6
 
@@ -291,10 +335,14 @@ jobs:
         with:
           tag_name: ${{ steps.get-tag.outputs.tag }}
           name: ${{ steps.get-tag.outputs.tag }}
-          files: ${{ steps.get-tag.outputs.src-dir }}/arch/x86/boot/bzImage
+          files: |
+            ${{ env.x64_output }}
+            ${{ env.arm64_output }}
           body: |
             # WSL2 内核编译
-            
+
             发布版本：${{ steps.get-tag.outputs.tag }}
-            
+
+            架构：x64 / ARM64
+
             基于 [microsoft/WSL2-Linux-Kernel](https://github.com/microsoft/WSL2-Linux-Kernel) 的对应版本编译。
