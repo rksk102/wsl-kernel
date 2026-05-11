@@ -16,9 +16,15 @@ permissions:
   actions: read
 
 jobs:
-  build_and_release:
-    name: 构建内核
+  prepare:
+    name: 准备构建
     runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check-need-build.outputs.should_build }}
+      skip_reason: ${{ steps.check-need-build.outputs.skip_reason }}
+      tag: ${{ steps.get-tag.outputs.tag }}
+      published_at: ${{ steps.get-tag.outputs.published_at }}
+      src_dir: ${{ steps.get-tag.outputs.src-dir }}
     steps:
       - name: 工作流信息展示
         run: |
@@ -39,7 +45,7 @@ jobs:
         id: get-tag
         run: |
           set -euo pipefail
-          echo "步骤 1/9: 获取版本标签"
+          echo "步骤 1: 获取版本标签"
           if [ -n "${{ inputs.tag }}" ]; then
             TAG="${{ inputs.tag }}"
             echo "使用手动指定的标签: $TAG"
@@ -68,7 +74,7 @@ jobs:
         id: check-need-build
         run: |
           set -euo pipefail
-          echo "步骤 2/9: 检查是否需要编译"
+          echo "步骤 2: 检查是否需要编译"
           TAG="${{ steps.get-tag.outputs.tag }}"
           PUBLISHED_AT="${{ steps.get-tag.outputs.published_at }}"
           EVENT_NAME="${{ github.event_name }}"
@@ -132,12 +138,32 @@ jobs:
           echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
           echo "skip_reason=$SKIP_REASON" >> "$GITHUB_OUTPUT"
 
+  build:
+    name: 编译 ${{ matrix.arch }}
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            kernel_arch: x86
+            kernel_target: bzImage
+            cross_compile: ""
+            extra_deps: ""
+          - arch: arm64
+            kernel_arch: arm64
+            kernel_target: Image.gz
+            cross_compile: aarch64-linux-gnu-
+            extra_deps: "gcc-aarch64-linux-gnu"
+    outputs:
+      output_file: ${{ steps.verify.outputs.output_file }}
+    steps:
       - name: 下载并解压源码
-        if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          TAG="${{ steps.get-tag.outputs.tag }}"
-          echo "步骤 3/9: 下载并解压源码"
+          TAG="${{ needs.prepare.outputs.tag }}"
+          echo "下载并解压源码"
           echo "下载地址: https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$TAG.tar.gz"
           echo "正在下载..."
           curl -sSfL \
@@ -153,7 +179,7 @@ jobs:
           echo "正在解压源码包..."
           tar xzf kernel.tar.gz
           echo "解压完成"
-          SRC_DIR="${{ steps.get-tag.outputs.src-dir }}"
+          SRC_DIR="${{ needs.prepare.outputs.src_dir }}"
           if [ -d "$SRC_DIR" ]; then
             echo "目录大小: $(du -sh "$SRC_DIR" | cut -f1)"
             echo "文件数: $(find "$SRC_DIR" -type f | wc -l)"
@@ -165,10 +191,9 @@ jobs:
           echo "源码准备完成"
 
       - name: 安装编译依赖
-        if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          echo "步骤 4/9: 安装编译依赖"
+          echo "安装编译依赖"
           echo "正在更新软件包列表..."
           sudo apt-get update -qq
           echo "正在安装编译依赖..."
@@ -183,7 +208,7 @@ jobs:
             "python3"
             "cpio"
             "qemu-utils"
-            "gcc-aarch64-linux-gnu"
+            ${{ matrix.extra_deps }}
           )
           echo "将安装 ${#DEPENDENCIES[@]} 个软件包"
           for pkg in "${DEPENDENCIES[@]}"; do
@@ -193,13 +218,15 @@ jobs:
           echo "依赖安装完成"
           echo "检查 gcc 版本:"
           gcc --version
+          if [ -n "${{ matrix.cross_compile }}" ]; then
+            echo "检查交叉编译器版本:"
+            ${{ matrix.cross_compile }}gcc --version
+          fi
 
-      - name: 编译内核 (x64)
-        if: steps.check-need-build.outputs.should_build == 'true'
+      - name: 编译内核 (${{ matrix.arch }})
         run: |
           set -euo pipefail
-          echo "步骤 5/9: 编译 x64 内核"
-          SRC_DIR="${{ steps.get-tag.outputs.src-dir }}"
+          SRC_DIR="${{ needs.prepare.outputs.src_dir }}"
           cd "$SRC_DIR"
           echo "当前目录: $(pwd)"
           CONFIG_FILE="Microsoft/config-wsl"
@@ -211,137 +238,114 @@ jobs:
             echo "错误: 配置文件不存在！"
             exit 1
           fi
-          echo "开始编译 x64 内核..."
+          echo "开始编译 ${{ matrix.arch }} 内核..."
           echo "编译开始时间: $(date -u)"
           echo "可用核心数: $(nproc)"
           echo "内存信息:"
           free -h
           echo "-------------------"
-          echo "开始 make x64..."
+          echo "开始 make..."
           echo "-------------------"
-          time make -j$(nproc) KCONFIG_CONFIG="$CONFIG_FILE"
+          if [ -n "${{ matrix.cross_compile }}" ]; then
+            time make -j$(nproc) ARCH=${{ matrix.kernel_arch }} CROSS_COMPILE=${{ matrix.cross_compile }} KCONFIG_CONFIG="$CONFIG_FILE" ${{ matrix.kernel_target }}
+          else
+            time make -j$(nproc) KCONFIG_CONFIG="$CONFIG_FILE" ${{ matrix.kernel_target }}
+          fi
           echo "-------------------"
-          echo "x64 编译完成时间: $(date -u)"
-
-      - name: 编译内核 (ARM64)
-        if: steps.check-need-build.outputs.should_build == 'true'
-        run: |
-          set -euo pipefail
-          echo "步骤 6/9: 编译 ARM64 内核"
-          SRC_DIR="${{ steps.get-tag.outputs.src-dir }}"
-          cd "$SRC_DIR"
-          echo "当前目录: $(pwd)"
-          CONFIG_FILE="Microsoft/config-wsl"
-          echo "使用配置文件: $CONFIG_FILE"
-          echo "清理 x64 编译产物..."
-          make mrproper
-          echo "开始编译 ARM64 内核..."
-          echo "编译开始时间: $(date -u)"
-          echo "可用核心数: $(nproc)"
-          echo "内存信息:"
-          free -h
-          echo "-------------------"
-          echo "开始 make ARM64..."
-          echo "-------------------"
-          time make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KCONFIG_CONFIG="$CONFIG_FILE"
-          echo "-------------------"
-          echo "ARM64 编译完成时间: $(date -u)"
+          echo "编译完成时间: $(date -u)"
 
       - name: 验证内核镜像
-        if: steps.check-need-build.outputs.should_build == 'true'
+        id: verify
         run: |
           set -euo pipefail
-          echo "步骤 7/9: 验证内核镜像"
-          TAG="${{ steps.get-tag.outputs.tag }}"
-          SRC_DIR="${{ steps.get-tag.outputs.src-dir }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
+          SRC_DIR="${{ needs.prepare.outputs.src_dir }}"
 
-          BZIMAGE_PATH="$SRC_DIR/arch/x86/boot/bzImage"
-          ARM64_IMAGE_PATH="$SRC_DIR/arch/arm64/boot/Image"
-          ARM64_IMAGE_GZ_PATH="$SRC_DIR/arch/arm64/boot/Image.gz"
-
-          if [ ! -f "$BZIMAGE_PATH" ]; then
-            echo "错误: 在 $BZIMAGE_PATH 未找到 bzImage"
-            ls -la "$SRC_DIR/arch/x86/boot/" 2>/dev/null || echo "目录不存在"
-            exit 1
-          fi
-          echo "x64 bzImage 验证成功！"
-          echo "文件路径: $BZIMAGE_PATH"
-          echo "文件大小: $(du -h "$BZIMAGE_PATH" | cut -f1)"
-
-          if [ -f "$ARM64_IMAGE_GZ_PATH" ]; then
-            ARM64_IMAGE="$ARM64_IMAGE_GZ_PATH"
-            ARM64_SUFFIX="Image.gz"
-          elif [ -f "$ARM64_IMAGE_PATH" ]; then
-            ARM64_IMAGE="$ARM64_IMAGE_PATH"
-            ARM64_SUFFIX="Image"
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            IMAGE_PATH="$SRC_DIR/arch/x86/boot/bzImage"
           else
-            echo "错误: 在 $SRC_DIR/arch/arm64/boot/ 未找到 ARM64 内核镜像"
-            ls -la "$SRC_DIR/arch/arm64/boot/" 2>/dev/null || echo "目录不存在"
+            if [ -f "$SRC_DIR/arch/arm64/boot/Image.gz" ]; then
+              IMAGE_PATH="$SRC_DIR/arch/arm64/boot/Image.gz"
+            elif [ -f "$SRC_DIR/arch/arm64/boot/Image" ]; then
+              IMAGE_PATH="$SRC_DIR/arch/arm64/boot/Image"
+            else
+              echo "错误: 在 $SRC_DIR/arch/arm64/boot/ 未找到 ARM64 内核镜像"
+              ls -la "$SRC_DIR/arch/arm64/boot/" 2>/dev/null || echo "目录不存在"
+              exit 1
+            fi
+          fi
+
+          if [ ! -f "$IMAGE_PATH" ]; then
+            echo "错误: 在 $IMAGE_PATH 未找到内核镜像"
+            ls -la "$(dirname "$IMAGE_PATH")" 2>/dev/null || echo "目录不存在"
             exit 1
           fi
-          echo "ARM64 内核镜像验证成功！"
-          echo "文件类型: $ARM64_SUFFIX"
-          echo "文件路径: $ARM64_IMAGE"
-          echo "文件大小: $(du -h "$ARM64_IMAGE" | cut -f1)"
+          echo "${{ matrix.arch }} 内核镜像验证成功！"
+          echo "文件路径: $IMAGE_PATH"
+          echo "文件大小: $(du -h "$IMAGE_PATH" | cut -f1)"
 
-          X64_OUTPUT="bzImage-$TAG-x64"
-          ARM64_OUTPUT="bzImage-$TAG-arm64"
-          cp "$BZIMAGE_PATH" "$X64_OUTPUT"
-          cp "$ARM64_IMAGE" "$ARM64_OUTPUT"
-          echo "x64_output=$X64_OUTPUT" >> "$GITHUB_ENV"
-          echo "arm64_output=$ARM64_OUTPUT" >> "$GITHUB_ENV"
-          echo "文件已重命名为: $X64_OUTPUT, $ARM64_OUTPUT"
+          OUTPUT_FILE="bzImage-$TAG-${{ matrix.arch }}"
+          cp "$IMAGE_PATH" "$OUTPUT_FILE"
+          echo "output_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+          echo "文件已重命名为: $OUTPUT_FILE"
 
       - name: 编译摘要
-        if: steps.check-need-build.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          echo "步骤 8/9: 编译摘要"
           echo "======================================="
-          echo "构建成功！"
+          echo "${{ matrix.arch }} 构建成功！"
           echo "======================================="
-          TAG="${{ steps.get-tag.outputs.tag }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
           echo "标签: $TAG"
-          if [ -f "$x64_output" ]; then
-            echo "--- x64 ---"
-            echo "文件名: $x64_output"
-            echo "文件大小: $(du -h "$x64_output" | cut -f1)"
-            echo "MD5: $(md5sum "$x64_output" | cut -d' ' -f1)"
-            echo "SHA256: $(sha256sum "$x64_output" | cut -d' ' -f1)"
-          fi
-          if [ -f "$arm64_output" ]; then
-            echo "--- ARM64 ---"
-            echo "文件名: $arm64_output"
-            echo "文件大小: $(du -h "$arm64_output" | cut -f1)"
-            echo "MD5: $(md5sum "$arm64_output" | cut -d' ' -f1)"
-            echo "SHA256: $(sha256sum "$arm64_output" | cut -d' ' -f1)"
+          OUTPUT_FILE="bzImage-$TAG-${{ matrix.arch }}"
+          if [ -f "$OUTPUT_FILE" ]; then
+            echo "文件名: $OUTPUT_FILE"
+            echo "文件大小: $(du -h "$OUTPUT_FILE" | cut -f1)"
+            echo "MD5: $(md5sum "$OUTPUT_FILE" | cut -d' ' -f1)"
+            echo "SHA256: $(sha256sum "$OUTPUT_FILE" | cut -d' ' -f1)"
           fi
           echo "======================================="
 
       - name: 上传临时内核镜像 (保留 1 天)
-        if: steps.check-need-build.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-images-${{ steps.get-tag.outputs.tag }}
-          path: |
-            ${{ env.x64_output }}
-            ${{ env.arm64_output }}
+          name: bzImage-${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
+          path: bzImage-${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
           retention-days: 1
           compression-level: 6
 
+  release:
+    name: 发布内核
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载 x64 内核镜像
+        uses: actions/download-artifact@v4
+        with:
+          name: bzImage-${{ needs.prepare.outputs.tag }}-x64
+
+      - name: 下载 ARM64 内核镜像
+        uses: actions/download-artifact@v4
+        with:
+          name: bzImage-${{ needs.prepare.outputs.tag }}-arm64
+
+      - name: 显示文件
+        run: |
+          ls -la
+
       - name: 发布到 GitHub Releases
-        if: steps.check-need-build.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.get-tag.outputs.tag }}
-          name: ${{ steps.get-tag.outputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
           files: |
-            ${{ env.x64_output }}
-            ${{ env.arm64_output }}
+            bzImage-${{ needs.prepare.outputs.tag }}-x64
+            bzImage-${{ needs.prepare.outputs.tag }}-arm64
           body: |
             # WSL2 内核编译
 
-            发布版本：${{ steps.get-tag.outputs.tag }}
+            发布版本：${{ needs.prepare.outputs.tag }}
 
             架构：x64 / ARM64
 
