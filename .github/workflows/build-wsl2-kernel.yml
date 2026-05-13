@@ -15,10 +15,15 @@ permissions:
   contents: write
   actions: read
 
+concurrency:
+  group: build-wsl2-kernel-${{ github.event.inputs.tag || 'scheduled' }}
+  cancel-in-progress: false
+
 jobs:
   prepare:
     name: 准备构建
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       should_build: ${{ steps.check-need-build.outputs.should_build }}
       skip_reason: ${{ steps.check-need-build.outputs.skip_reason }}
@@ -80,7 +85,7 @@ jobs:
           EVENT_NAME="${{ github.event_name }}"
           SHOULD_BUILD="true"
           SKIP_REASON=""
-          
+
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "手动触发，将执行编译"
             SHOULD_BUILD="true"
@@ -93,7 +98,7 @@ jobs:
               --user-agent "GitHub Actions (WSL2 Kernel Build)" \
               --header "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               "$RELEASE_API" || echo "[]")
-            if echo "$RELEASE_RESPONSE" | grep -q "\"tag_name\":\"$TAG\""; then
+            if echo "$RELEASE_RESPONSE" | jq -e --arg tag "$TAG" '.[] | select(.tag_name == $tag)' > /dev/null 2>&1; then
               echo "发现已存在的 release: $TAG"
               SHOULD_BUILD="false"
               SKIP_REASON="该标签的 release 已存在"
@@ -124,7 +129,7 @@ jobs:
               fi
             fi
           fi
-          
+
           echo "===================="
           echo "编译决策结果"
           echo "===================="
@@ -134,7 +139,7 @@ jobs:
             echo "跳过原因: $SKIP_REASON"
           fi
           echo "===================="
-          
+
           echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
           echo "skip_reason=$SKIP_REASON" >> "$GITHUB_OUTPUT"
 
@@ -142,8 +147,10 @@ jobs:
     name: 编译 ${{ matrix.arch }}
     needs: prepare
     if: needs.prepare.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x64
@@ -156,15 +163,23 @@ jobs:
             kernel_target: Image.gz
             cross_compile: aarch64-linux-gnu-
             extra_deps: "gcc-aarch64-linux-gnu"
-    outputs:
-      output_file: ${{ steps.verify.outputs.output_file }}
     steps:
+      - name: 恢复 ccache 缓存
+        id: ccache-restore
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.arch }}-${{ needs.prepare.outputs.tag }}
+          restore-keys: |
+            ccache-${{ matrix.arch }}-
+
       - name: 下载并解压源码
         run: |
           set -euo pipefail
           TAG="${{ needs.prepare.outputs.tag }}"
+          TARBALL_URL="https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$TAG.tar.gz"
           echo "下载并解压源码"
-          echo "下载地址: https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$TAG.tar.gz"
+          echo "下载地址: $TARBALL_URL"
           echo "正在下载..."
           curl -sSfL \
             --retry 3 \
@@ -172,10 +187,15 @@ jobs:
             --user-agent "GitHub Actions (WSL2 Kernel Build)" \
             --progress-bar \
             -o kernel.tar.gz \
-            "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/$TAG.tar.gz"
+            "$TARBALL_URL"
           echo "下载完成"
           FILE_SIZE=$(du -h kernel.tar.gz | cut -f1)
           echo "文件大小: $FILE_SIZE"
+
+          echo "计算源码包校验和..."
+          SHA256_TARBALL=$(sha256sum kernel.tar.gz | cut -d' ' -f1)
+          echo "SHA256: $SHA256_TARBALL"
+
           echo "正在解压源码包..."
           tar xzf kernel.tar.gz
           echo "解压完成"
@@ -184,11 +204,14 @@ jobs:
             echo "目录大小: $(du -sh "$SRC_DIR" | cut -f1)"
             echo "文件数: $(find "$SRC_DIR" -type f | wc -l)"
           else
-            echo "警告: 目录 $SRC_DIR 不存在！"
+            echo "错误: 目录 $SRC_DIR 不存在！"
+            exit 1
           fi
           echo "清理临时文件 kernel.tar.gz..."
           rm -f kernel.tar.gz
           echo "源码准备完成"
+
+          echo "tarball-sha256=$SHA256_TARBALL" >> "$GITHUB_OUTPUT"
 
       - name: 安装编译依赖
         run: |
@@ -197,7 +220,7 @@ jobs:
           echo "正在更新软件包列表..."
           sudo apt-get update -qq
           echo "正在安装编译依赖..."
-          DEPENDENCIES=(
+          DEPS=(
             "build-essential"
             "flex"
             "bison"
@@ -208,22 +231,34 @@ jobs:
             "python3"
             "cpio"
             "qemu-utils"
-            ${{ matrix.extra_deps }}
+            "ccache"
           )
-          echo "将安装 ${#DEPENDENCIES[@]} 个软件包"
-          for pkg in "${DEPENDENCIES[@]}"; do
+          EXTRA="${{ matrix.extra_deps }}"
+          if [ -n "$EXTRA" ]; then
+            DEPS+=("$EXTRA")
+          fi
+          echo "将安装 ${#DEPS[@]} 个软件包:"
+          for pkg in "${DEPS[@]}"; do
             echo "  - $pkg"
           done
-          sudo apt-get install -y "${DEPENDENCIES[@]}"
+          sudo apt-get install -y "${DEPS[@]}"
           echo "依赖安装完成"
-          echo "检查 gcc 版本:"
-          gcc --version
+
+          ccache --version
+          ccache --zero-stats
+          ccache --max-size=2G
+          echo "ccache 配置完成（上限: 2G）"
+
+          echo "检查编译器版本:"
+          echo "--- gcc ---"
+          gcc --version | head -1
           if [ -n "${{ matrix.cross_compile }}" ]; then
-            echo "检查交叉编译器版本:"
-            ${{ matrix.cross_compile }}gcc --version
+            echo "--- 交叉编译器 ---"
+            ${{ matrix.cross_compile }}gcc --version | head -1
           fi
 
       - name: 编译内核 (${{ matrix.arch }})
+        id: build
         run: |
           set -euo pipefail
           SRC_DIR="${{ needs.prepare.outputs.src_dir }}"
@@ -232,27 +267,44 @@ jobs:
           CONFIG_FILE="Microsoft/config-wsl"
           echo "使用配置文件: $CONFIG_FILE"
           if [ -f "$CONFIG_FILE" ]; then
-            echo "配置文件存在"
-            echo "配置文件大小: $(du -h "$CONFIG_FILE" | cut -f1)"
+            echo "配置文件存在，大小: $(du -h "$CONFIG_FILE" | cut -f1)"
           else
-            echo "错误: 配置文件不存在！"
+            echo "错误: 配置文件 $CONFIG_FILE 不存在！"
             exit 1
           fi
+
           echo "开始编译 ${{ matrix.arch }} 内核..."
           echo "编译开始时间: $(date -u)"
           echo "可用核心数: $(nproc)"
           echo "内存信息:"
           free -h
           echo "-------------------"
-          echo "开始 make..."
-          echo "-------------------"
+
+          export PATH="/usr/lib/ccache:$PATH"
+
+          BUILD_LOG="/tmp/build-${{ matrix.arch }}.log"
           if [ -n "${{ matrix.cross_compile }}" ]; then
-            time make -j$(nproc) ARCH=${{ matrix.kernel_arch }} CROSS_COMPILE=${{ matrix.cross_compile }} KCONFIG_CONFIG="$CONFIG_FILE" ${{ matrix.kernel_target }}
+            time make -j$(nproc) \
+              ARCH=${{ matrix.kernel_arch }} \
+              CROSS_COMPILE=${{ matrix.cross_compile }} \
+              KCONFIG_CONFIG="$CONFIG_FILE" \
+              ${{ matrix.kernel_target }} 2>&1 | tee "$BUILD_LOG"
           else
-            time make -j$(nproc) KCONFIG_CONFIG="$CONFIG_FILE" ${{ matrix.kernel_target }}
+            time make -j$(nproc) \
+              KCONFIG_CONFIG="$CONFIG_FILE" \
+              ${{ matrix.kernel_target }} 2>&1 | tee "$BUILD_LOG"
           fi
+
           echo "-------------------"
           echo "编译完成时间: $(date -u)"
+          echo "build-log=$BUILD_LOG" >> "$GITHUB_OUTPUT"
+
+      - name: 编译统计
+        run: |
+          echo "=== ccache 统计 ==="
+          ccache --show-stats
+          echo "=== ccache 命中率 ==="
+          ccache --show-stats 2>&1 | grep -E "cache hit|hit rate|cache miss"
 
       - name: 验证内核镜像
         id: verify
@@ -269,7 +321,7 @@ jobs:
             elif [ -f "$SRC_DIR/arch/arm64/boot/Image" ]; then
               IMAGE_PATH="$SRC_DIR/arch/arm64/boot/Image"
             else
-              echo "错误: 在 $SRC_DIR/arch/arm64/boot/ 未找到 ARM64 内核镜像"
+              echo "错误: ARM64 内核镜像不存在"
               ls -la "$SRC_DIR/arch/arm64/boot/" 2>/dev/null || echo "目录不存在"
               exit 1
             fi
@@ -280,9 +332,53 @@ jobs:
             ls -la "$(dirname "$IMAGE_PATH")" 2>/dev/null || echo "目录不存在"
             exit 1
           fi
-          echo "${{ matrix.arch }} 内核镜像验证成功！"
+
+          echo "${{ matrix.arch }} 内核镜像验证成功"
           echo "文件路径: $IMAGE_PATH"
           echo "文件大小: $(du -h "$IMAGE_PATH" | cut -f1)"
+
+          echo "验证文件类型..."
+          file "$IMAGE_PATH" || true
+
+          echo "检查 bzImage 魔数..."
+          xxd "$IMAGE_PATH" | head -3 || true
+
+          echo "验证 WSL 关键内核配置..."
+          CONFIG_FILE="$SRC_DIR/Microsoft/config-wsl"
+          WSL_CONFIGS_OK="true"
+          check_config() {
+            local key="$1"
+            local expected="$2"
+            local actual
+            actual=$(grep "^${key}=" "$CONFIG_FILE" 2>/dev/null || echo "")
+            if [ -z "$actual" ]; then
+              echo "  警告: $key 未在配置文件中找到"
+              WSL_CONFIGS_OK="false"
+            elif [ -n "$expected" ]; then
+              local value=$(echo "$actual" | cut -d= -f2)
+              if [ "$value" != "$expected" ]; then
+                echo "  警告: $actual (期望: $expected)"
+                WSL_CONFIGS_OK="false"
+              else
+                echo "  $actual ✓"
+              fi
+            else
+              echo "  $actual"
+            fi
+          }
+          echo "--- 关键配置检查 ---"
+          check_config "CONFIG_HYPERV" "y"
+          check_config "CONFIG_HYPERV_VSOCKET" "y"
+          check_config "CONFIG_VSOCKETS" "y"
+          check_config "CONFIG_9P_FS" "y"
+          check_config "CONFIG_NET_9P" "y"
+          check_config "CONFIG_LOCALVERSION" ""
+          echo "---------------------"
+          if [ "$WSL_CONFIGS_OK" = "false" ]; then
+            echo "警告: 部分 WSL 关键配置未找到，但继续执行"
+          else
+            echo "WSL 关键配置检查通过"
+          fi
 
           OUTPUT_FILE="bzImage-$TAG-${{ matrix.arch }}"
           cp "$IMAGE_PATH" "$OUTPUT_FILE"
@@ -296,46 +392,87 @@ jobs:
           echo "${{ matrix.arch }} 构建成功！"
           echo "======================================="
           TAG="${{ needs.prepare.outputs.tag }}"
-          echo "标签: $TAG"
           OUTPUT_FILE="bzImage-$TAG-${{ matrix.arch }}"
           if [ -f "$OUTPUT_FILE" ]; then
             echo "文件名: $OUTPUT_FILE"
             echo "文件大小: $(du -h "$OUTPUT_FILE" | cut -f1)"
-            echo "MD5: $(md5sum "$OUTPUT_FILE" | cut -d' ' -f1)"
             echo "SHA256: $(sha256sum "$OUTPUT_FILE" | cut -d' ' -f1)"
           fi
           echo "======================================="
 
-      - name: 上传临时内核镜像 (保留 1 天)
-        uses: actions/upload-artifact@v4
+      - name: 保存 ccache 缓存
+        if: always() && steps.ccache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.arch }}-${{ needs.prepare.outputs.tag }}
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: build-log-${{ matrix.arch }}-${{ needs.prepare.outputs.tag }}
+          path: /tmp/build-${{ matrix.arch }}.log
+          retention-days: 7
+          compression-level: 1
+
+      - name: 上传内核镜像（临时）
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: bzImage-${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
           path: bzImage-${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
-          retention-days: 1
+          retention-days: 7
           compression-level: 6
 
   release:
     name: 发布内核
     needs: [prepare, build]
     if: needs.prepare.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: 下载 x64 内核镜像
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
         with:
           name: bzImage-${{ needs.prepare.outputs.tag }}-x64
 
       - name: 下载 ARM64 内核镜像
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
         with:
           name: bzImage-${{ needs.prepare.outputs.tag }}-arm64
 
-      - name: 显示文件
+      - name: 汇总构建信息
+        id: summary
         run: |
-          ls -la
+          set -euo pipefail
+          echo "=== 构建产物 ==="
+          ls -la bzImage-*
+
+          echo "--- 校验和 ---"
+          X64_SHA256=$(sha256sum "bzImage-${{ needs.prepare.outputs.tag }}-x64" | cut -d' ' -f1)
+          ARM64_SHA256=$(sha256sum "bzImage-${{ needs.prepare.outputs.tag }}-arm64" | cut -d' ' -f1)
+          echo "x64   SHA256: $X64_SHA256"
+          echo "arm64 SHA256: $ARM64_SHA256"
+
+          echo "x64-sha256=$X64_SHA256" >> "$GITHUB_OUTPUT"
+          echo "arm64-sha256=$ARM64_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: 获取上游 Release Notes
+        id: upstream-notes
+        run: |
+          set -euo pipefail
+          echo "获取上游发布说明..."
+          UPSTREAM_NOTES=$(curl -sSfL \
+            --retry 3 \
+            --user-agent "GitHub Actions (WSL2 Kernel Build)" \
+            --header "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/releases/tags/${{ needs.prepare.outputs.tag }}" \
+            | jq -r '.body // "*上游未提供发布说明*"')
+          echo "$UPSTREAM_NOTES" > /tmp/upstream_notes.md
+          echo "notes-file=/tmp/upstream_notes.md" >> "$GITHUB_OUTPUT"
 
       - name: 发布到 GitHub Releases
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda  # v2.2.1
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: ${{ needs.prepare.outputs.tag }}
@@ -343,10 +480,24 @@ jobs:
             bzImage-${{ needs.prepare.outputs.tag }}-x64
             bzImage-${{ needs.prepare.outputs.tag }}-arm64
           body: |
-            # WSL2 内核编译
+            # WSL2 内核预编译镜像
 
-            发布版本：${{ needs.prepare.outputs.tag }}
+            **发布版本**: `${{ needs.prepare.outputs.tag }}`
 
-            架构：x64 / ARM64
+            基于 [microsoft/WSL2-Linux-Kernel](https://github.com/microsoft/WSL2-Linux-Kernel) 自动编译。
 
-            基于 [microsoft/WSL2-Linux-Kernel](https://github.com/microsoft/WSL2-Linux-Kernel) 的对应版本编译。
+            ## 支持架构
+            | 架构 | 文件 | SHA256 |
+            |------|------|--------|
+            | x64 | `bzImage-${{ needs.prepare.outputs.tag }}-x64` | `${{ steps.summary.outputs.x64-sha256 }}` |
+            | ARM64 | `bzImage-${{ needs.prepare.outputs.tag }}-arm64` | `${{ steps.summary.outputs.arm64-sha256 }}` |
+
+            ## 构建信息
+            - Runner: `${{ runner.os }} ${{ runner.arch }}` (`${{ runner.name }}`)
+            - 触发方式: `${{ github.event_name }}`
+            - 构建时间: `$(date -u +'%Y-%m-%d %H:%M:%S UTC')`
+
+            ---
+
+            ## 上游发布说明
+            $(cat /tmp/upstream_notes.md 2>/dev/null || echo "*上游发布说明暂不可用*")
