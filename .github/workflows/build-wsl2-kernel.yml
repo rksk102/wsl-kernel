@@ -303,8 +303,8 @@ jobs:
         run: |
           echo "=== ccache 统计 ==="
           ccache --show-stats
-          echo "=== ccache 命中率 ==="
-          ccache --show-stats 2>&1 | grep -E "cache hit|hit rate|cache miss"
+          echo "=== ccache 关键指标 ==="
+          ccache --show-stats 2>&1 | grep -iE "Hits:|Misses:|hit rate|cache size|Local storage" || echo "(ccache 统计提取完成)"
 
       - name: 验证内核镜像
         id: verify
